@@ -1,0 +1,34 @@
+# Highlights: Postgres + ingest/read service. LAN only: no proxy host, no tunnel (ISA A5).
+# Secrets live in .env next to this file (see .env.example); POSTGRES_PASSWORD is mapped from a
+# stack-unique name because borgmatic loads several stacks' .env files at once.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: highlights
+      POSTGRES_USER: highlights
+      POSTGRES_PASSWORD: ${HL_POSTGRES_PASSWORD}
+    labels:
+      - com.getarcaneapp.arcane.updater=false
+    volumes:
+      - /srv/appdata/highlights/pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U highlights -d highlights"]
+      interval: 10s
+      retries: 10
+  app:
+    image: ghcr.io/christopher-nies/highlights:latest
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8790:8790"
+    environment:
+      DATABASE_URL: postgres://highlights:${HL_POSTGRES_PASSWORD}@postgres:5432/highlights
+      READECK_URL: ${READECK_URL}
+      READECK_TOKEN: ${READECK_TOKEN}
+      INGEST_MINUTES: ${INGEST_MINUTES:-60}
+      TZ: Europe/Berlin
+    depends_on:
+      postgres:
+        condition: service_healthy

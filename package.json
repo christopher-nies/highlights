@@ -1,0 +1,10 @@
+{
+  "name": "highlights",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "bun src/main.ts",
+    "ingest": "bun src/main.ts ingest",
+    "test": "bun test"
+  }
+}
