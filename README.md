@@ -1,14 +1,14 @@
 # highlights
 
 A small self-hosted store for your reading highlights. It pulls the highlights you make in
-[Readeck](https://readeck.org) into Postgres (the passage, your note, colour, source, deep link,
-author and dates, never the article text) and gives one back each day over HTTP, so a daily note,
+[Readeck](https://readeck.org) (articles) and [BookOrbit](https://github.com/bookorbit/bookorbit) (books) into Postgres
+(the passage, your note, colour, source, deep link, author and dates, never the article or book text) and gives one back each day over HTTP, so a daily note,
 a widget or an LLM can use them.
 
 ## Run it
 
 ```sh
-cp .env.example .env          # set a database password, your Readeck URL and a read-only API token
+cp .env.example .env          # database password, plus Readeck and/or BookOrbit access (each source is optional)
 docker compose up -d
 curl http://localhost:8790/health
 ```
@@ -25,8 +25,10 @@ Back it up as a dump (`pg_dump -Fc`), not by copying the data directory.
 | `/today` | today's highlight (`?date=YYYY-MM-DD` for another day): the same one all day, least recently shown first; 204 when the store is empty |
 | `/random` | any live highlight, not counted as shown |
 
-The ingest runs at start and every `INGEST_MINUTES` (default 60). It mirrors edits and deletions:
-a highlight deleted in Readeck is marked deleted here and kept.
+The ingest runs at start and every `INGEST_MINUTES` (default 60). Each configured source runs on its own,
+and one failing never blocks the other. It mirrors edits and deletions: a highlight deleted (or trashed) upstream
+is marked deleted here and kept. BookOrbit lists only the logged-in user's own highlights, so log in as the reader
+whose highlights you collect; a run is one login plus one request per 100 highlights, and never downloads books.
 
 ## CLI
 

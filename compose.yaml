@@ -27,6 +27,9 @@ services:
       DATABASE_URL: postgres://highlights:${HL_POSTGRES_PASSWORD}@postgres:5432/highlights
       READECK_URL: ${READECK_URL}
       READECK_TOKEN: ${READECK_TOKEN}
+      BOOKORBIT_URL: ${BOOKORBIT_URL:-}
+      BOOKORBIT_USERNAME: ${BOOKORBIT_USERNAME:-}
+      BOOKORBIT_PASSWORD: ${BOOKORBIT_PASSWORD:-}
       INGEST_MINUTES: ${INGEST_MINUTES:-60}
       TZ: Europe/Berlin
     depends_on:

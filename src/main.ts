@@ -7,13 +7,15 @@
  *   bun src/main.ts today [YYYY-MM-DD]   print that day's highlight as JSON
  *   bun src/main.ts random               print one random live highlight as JSON (not recorded as surfaced)
  *
- * Env: DATABASE_URL, READECK_URL, READECK_TOKEN, INGEST_MINUTES (60), PORT (8790), TZ (Europe/Berlin).
+ * Env: DATABASE_URL, READECK_URL, READECK_TOKEN, BOOKORBIT_URL, BOOKORBIT_USERNAME, BOOKORBIT_PASSWORD,
+ *      INGEST_MINUTES (60), PORT (8790), TZ (Europe/Berlin). A source runs only when all its variables are set.
  * ISA: ~/.claude/LIFEOS/USER/MEMORY/WORK/20261105-highlights-db/ISA.md
  */
 import { SQL } from "bun";
-import { migrate, randomHighlight, today } from "./store";
-import { ingestReadeck } from "./ingest";
+import { migrate, randomHighlight, today, type Counters } from "./store";
+import { ingestBookOrbit, ingestReadeck } from "./ingest";
 import { ReadeckClient } from "./readeck";
+import { BookOrbitClient } from "./bookorbit";
 import { localDay } from "./model";
 
 const env = process.env;
@@ -22,22 +24,37 @@ const sql = new SQL(env.DATABASE_URL!);
 const log = (msg: string, extra: Record<string, unknown> = {}) =>
   console.log(JSON.stringify({ at: new Date().toISOString(), msg, ...extra }));
 
-let lastIngest: { at: string; ok: boolean; counters?: unknown; error?: string } | null = null;
+type SourceResult = { ok: boolean; counters?: Counters; error?: string };
+let lastIngest: { at: string; ok: boolean; sources: Record<string, SourceResult> } | null = null;
+
+/** Each configured source runs on its own: one source failing never stops or rolls back another. */
+const sources: { name: string; configured: () => boolean; run: () => Promise<Counters> }[] = [
+  {
+    name: "readeck",
+    configured: () => Boolean(env.READECK_URL && env.READECK_TOKEN),
+    run: () => ingestReadeck(sql, new ReadeckClient(env.READECK_URL!, env.READECK_TOKEN!)),
+  },
+  {
+    name: "bookorbit",
+    configured: () => Boolean(env.BOOKORBIT_URL && env.BOOKORBIT_USERNAME && env.BOOKORBIT_PASSWORD),
+    run: () => ingestBookOrbit(sql, new BookOrbitClient(env.BOOKORBIT_URL!, env.BOOKORBIT_USERNAME!, env.BOOKORBIT_PASSWORD!)),
+  },
+];
 
 async function runIngest() {
-  if (!env.READECK_URL || !env.READECK_TOKEN) {
-    lastIngest = { at: new Date().toISOString(), ok: false, error: "READECK_URL or READECK_TOKEN not set" };
-    log("ingest skipped", { reason: lastIngest.error });
-    return lastIngest;
+  const results: Record<string, SourceResult> = {};
+  for (const s of sources) {
+    if (!s.configured()) continue;
+    try {
+      results[s.name] = { ok: true, counters: await s.run() };
+    } catch (e: any) {
+      results[s.name] = { ok: false, error: String(e?.message ?? e) };
+    }
   }
-  try {
-    const counters = await ingestReadeck(sql, new ReadeckClient(env.READECK_URL, env.READECK_TOKEN));
-    lastIngest = { at: new Date().toISOString(), ok: true, counters: { readeck: counters } };
-    log("ingest done", { readeck: counters });
-  } catch (e: any) {
-    lastIngest = { at: new Date().toISOString(), ok: false, error: String(e?.message ?? e) };
-    log("ingest failed", { error: lastIngest.error });
-  }
+  const names = Object.keys(results);
+  const ok = names.length > 0 && names.every((n) => results[n].ok);
+  lastIngest = { at: new Date().toISOString(), ok, sources: results };
+  log(names.length ? (ok ? "ingest done" : "ingest failed") : "ingest skipped: no source configured", { sources: results });
   return lastIngest;
 }
 
