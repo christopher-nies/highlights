@@ -8,13 +8,14 @@
  *   bun src/main.ts random               print one random live highlight as JSON (not recorded as surfaced)
  *   bun src/main.ts import-readwise [--dry-run]   one-off Readwise backfill (needs READWISE_TOKEN), prints a summary
  *
- * Env: DATABASE_URL, READECK_URL, READECK_TOKEN, BOOKORBIT_URL, BOOKORBIT_USERNAME, BOOKORBIT_PASSWORD,
+ * Env: DATABASE_URL, READECK_URL, READECK_TOKEN, BOOKORBIT_URL, BOOKORBIT_USERNAME, BOOKORBIT_PASSWORD, SNIPD_TOKEN,
  *      INGEST_MINUTES (60), PORT (8790), TZ (Europe/Berlin). A source runs only when all its variables are set.
  * ISA: ~/.claude/LIFEOS/USER/MEMORY/WORK/20261105-highlights-db/ISA.md
  */
 import { SQL } from "bun";
 import { migrate, randomHighlight, today, type Counters } from "./store";
-import { importReadwise, ingestBookOrbit, ingestReadeck } from "./ingest";
+import { importReadwise, ingestBookOrbit, ingestReadeck, ingestSnipd } from "./ingest";
+import { SnipdClient } from "./snipd";
 import { ReadwiseClient } from "./readwise";
 import { ReadeckClient } from "./readeck";
 import { BookOrbitClient } from "./bookorbit";
@@ -40,6 +41,11 @@ const sources: { name: string; configured: () => boolean; run: () => Promise<Cou
     name: "bookorbit",
     configured: () => Boolean(env.BOOKORBIT_URL && env.BOOKORBIT_USERNAME && env.BOOKORBIT_PASSWORD),
     run: () => ingestBookOrbit(sql, new BookOrbitClient(env.BOOKORBIT_URL!, env.BOOKORBIT_USERNAME!, env.BOOKORBIT_PASSWORD!)),
+  },
+  {
+    name: "snipd",
+    configured: () => Boolean(env.SNIPD_TOKEN),
+    run: () => ingestSnipd(sql, new SnipdClient(env.SNIPD_TOKEN!)),
   },
 ];
 

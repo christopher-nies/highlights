@@ -2,6 +2,7 @@ import type { SQL } from "bun";
 import { ReadeckClient, mapAnnotation, mapBookmark } from "./readeck";
 import { BookOrbitClient, mapAnnotation as mapBookOrbitAnnotation, mapBook } from "./bookorbit";
 import { ReadwiseClient, isOwnDocument, mapBook as mapReadwiseBook, mapHighlight as mapReadwiseHighlight } from "./readwise";
+import { SnipdClient, mapEpisode, mapSnip, parseEpisodeFile } from "./snipd";
 import { findDuplicates, knownDocIds, syncSource, type Counters } from "./store";
 import type { DocInput, HighlightInput } from "./model";
 
@@ -55,4 +56,34 @@ export async function importReadwise(sql: SQL, client: ReadwiseClient, { dryRun 
   };
   if (dryRun) return { dryRun: true, ...summary };
   return { ...summary, counters: await syncSource(sql, "readwise", docs, items) };
+}
+
+/**
+ * Mirror every Snipd snip (C19). The full list is exported each run, one metadata call plus one export per batch of
+ * episodes, so edits and deletions show up the way they do for the other sources. A snip without words is skipped.
+ * The run also reports what Snipd itself says: its snip total and newest snip, so a stale copy is never mistaken for it.
+ */
+export async function ingestSnipd(sql: SQL, client: SnipdClient) {
+  const meta = await client.metadata();
+  const episodes = meta.episode_batches.flatMap((b) => b.episodes);
+  const docs = new Map<string, DocInput>();
+  const items: HighlightInput[] = [];
+  let snips = 0;
+  for (const batch of meta.episode_batches) {
+    if (!batch.episodes.length) continue;
+    for (const [path, md] of await client.exportEpisodes(batch.episodes.map((e) => e.episode_id))) {
+      const parsed = parseEpisodeFile(path, md);
+      if (!parsed) continue;
+      snips += parsed.snips.length;
+      const mapped = parsed.snips.map((s) => mapSnip(s, parsed.episode.id)).filter((h): h is HighlightInput => h !== null);
+      if (!mapped.length) continue;
+      docs.set(parsed.episode.id, mapEpisode(parsed.episode));
+      items.push(...mapped);
+    }
+  }
+  const total = episodes.reduce((n, e) => n + e.total_snip_count, 0);
+  if (snips !== total) throw new Error(`snipd exported ${snips} snips but its metadata lists ${total}; not mirroring a partial export`);
+  const counters = await syncSource(sql, "snipd", docs, items);
+  const newest = episodes.map((e) => e.latest_snip_update_ts).sort().at(-1) ?? null;
+  return { ...counters, snipd: { episodes: episodes.length, snips: total, withoutWords: total - items.length, newest } };
 }

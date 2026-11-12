@@ -6,6 +6,10 @@ import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
 import { migrate, randomHighlight, syncSource, today } from "../src/store";
 import type { DocInput, HighlightInput } from "../src/model";
+import { ingestSnipd } from "../src/ingest";
+import type { SnipdClient } from "../src/snipd";
+import { unzipText } from "../src/zip";
+import { join } from "path";
 
 const url = process.env.TEST_DATABASE_URL;
 const d = url ? describe : describe.skip;
@@ -117,6 +121,21 @@ d("store against Postgres", () => {
     expect(row.tags).toEqual(["t1"]);
     await syncSource(sql, "readeck", new Map(), [hl("r2", "b1", { text: "Short one." })]);
     expect((await syncSource(sql, "readwise", new Map(), items)).inserted).toBe(2); // r1 deleted upstream: x1 and x2 come in
+  });
+
+  test("C19: Snipd mirrors snips with words, reports Snipd's own total and newest, refuses a partial export, re-runs clean", async () => {
+    const files = unzipText(await Bun.file(join(import.meta.dir, "fixtures", "snipd-export.zip")).arrayBuffer());
+    const ep = "11111111-2222-4333-8444-555555555555";
+    const client = (total: number) => ({
+      metadata: async () => ({ episode_batch_count: 1, episode_batches: [{ index: 0, episodes: [{ episode_id: ep, latest_snip_update_ts: "2026-11-07T09:00:00.000Z", total_snip_count: total }] }] }),
+      exportEpisodes: async () => files,
+    }) as unknown as SnipdClient;
+    const first = await ingestSnipd(sql, client(4));
+    expect(first).toMatchObject({ inserted: 3, duplicates: 0, snipd: { episodes: 1, snips: 4, withoutWords: 1, newest: "2026-11-07T09:00:00.000Z" } });
+    expect(await ingestSnipd(sql, client(4))).toMatchObject({ inserted: 0, updated: 0, deleted: 0, unchanged: 3 });
+    expect(ingestSnipd(sql, client(5))).rejects.toThrow("not mirroring a partial export");
+    const [{ gems }] = await sql`SELECT count(*)::int AS gems FROM highlights WHERE source_app = ${"snipd"} AND note = ${"*"}`;
+    expect(gems).toBe(1);
   });
 
   test("A3: only the passage is stored; there is no body column", async () => {
