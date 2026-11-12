@@ -4,7 +4,9 @@
  */
 import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { SQL } from "bun";
-import { migrate, randomHighlight, syncSource, today } from "../src/store";
+import { importModelRatings, migrate, randomHighlight, syncReaderRatings, syncSource, today, today as todayPick, unratedHighlights } from "../src/store";
+import { pickWeighted } from "../src/model";
+import dailyHighlight from "../obsidian/daily_highlight.js";
 import type { DocInput, HighlightInput } from "../src/model";
 import { ingestSnipd } from "../src/ingest";
 import type { SnipdClient } from "../src/snipd";
@@ -26,7 +28,7 @@ const docs = (...ids: string[]) => new Map(ids.map((i) => [i, doc(i)]));
 
 d("store against Postgres", () => {
   beforeEach(async () => {
-    await sql.unsafe("DROP TABLE IF EXISTS surfacings, highlights, documents CASCADE");
+    await sql.unsafe("DROP VIEW IF EXISTS current_ratings; DROP TABLE IF EXISTS ratings, surfacings, highlights, documents CASCADE");
     await migrate(sql);
   });
   afterAll(async () => sql?.close());
@@ -69,8 +71,10 @@ d("store against Postgres", () => {
     expect(live).toBe(12);
   });
 
-  test("C10: one highlight per day, stable all day, least recently shown first, never a deleted one", async () => {
+  test("C10: one highlight per day, stable all day, the longest-rested first when the draw is even, never a deleted one", async () => {
     await syncSource(sql, "readeck", docs("b1"), [hl("a1"), hl("a2"), hl("a3")]);
+    const even = () => 0.5; // a constant draw makes the weighted pick deterministic: the highest weight wins
+    const today = (s: SQL, day: string) => todayPick(s, day, even);
     const d1 = await today(sql, "2026-11-01");
     expect((await today(sql, "2026-11-01"))!.id).toBe(d1!.id);
     expect(d1).toMatchObject({ date: "2026-11-01", title: "Title b1", author: "Someone", kind: "article" });
@@ -136,6 +140,64 @@ d("store against Postgres", () => {
     expect(ingestSnipd(sql, client(5))).rejects.toThrow("not mirroring a partial export");
     const [{ gems }] = await sql`SELECT count(*)::int AS gems FROM highlights WHERE source_app = ${"snipd"} AND note = ${"*"}`;
     expect(gems).toBe(1);
+  });
+
+  test("C13/C14: note markers become reader ratings as history; the daily note shows the note without the marker", async () => {
+    await syncSource(sql, "readeck", docs("b1"), [hl("a1", "b1", { note: "*3 why" }), hl("a2", "b1", { note: "* why" }), hl("a3", "b1", { note: "why *" }), hl("a4", "b1", { note: "*8" })]);
+    expect(await syncReaderRatings(sql)).toEqual({ changed: 2 });
+    expect(await syncReaderRatings(sql)).toEqual({ changed: 0 }); // unchanged notes write nothing
+    const rating = async (ext: string) => (await sql`SELECT cr.score, cr.rated_by FROM current_ratings cr JOIN highlights h ON h.id = cr.highlight_id WHERE h.external_id = ${ext}`)[0];
+    expect(await rating("a1")).toEqual({ score: 3, rated_by: "reader" });
+    expect(await rating("a2")).toEqual({ score: 7, rated_by: "reader" });
+    expect(await rating("a3")).toEqual({ score: null, rated_by: null });
+    expect(await rating("a4")).toEqual({ score: null, rated_by: null });
+
+    // a model rating never beats his; once his marker is removed, the model rating is in force
+    const [{ id: a1 }] = await sql`SELECT id FROM highlights WHERE external_id = ${"a1"}`;
+    expect(await importModelRatings(sql, [{ highlight_id: a1, score: 6, reason: "r", model: "m", rubric_version: "v1" }])).toEqual({ inserted: 1, rejected: 0 });
+    expect(await rating("a1")).toEqual({ score: 3, rated_by: "reader" });
+    await syncSource(sql, "readeck", new Map(), [hl("a1", "b1", { note: "*5 why" }), hl("a2", "b1", { note: "why" }), hl("a3", "b1", { note: "why *" }), hl("a4", "b1", { note: "*8" })]);
+    expect(await syncReaderRatings(sql)).toEqual({ changed: 2 }); // a1 changed to 5, a2 marker removed
+    expect(await rating("a1")).toEqual({ score: 5, rated_by: "reader" });
+    expect(await rating("a2")).toEqual({ score: null, rated_by: null });
+    const [{ n }] = await sql`SELECT count(*)::int AS n FROM ratings WHERE rater = ${"reader"}`;
+    expect(n).toBe(4); // a1: 3 then 5; a2: 7 then removed
+
+    // the API strips the marker, and the daily note prints only the words
+    const pick = await todayPick(sql, "2026-11-01", () => 0.5);
+    expect(pick!.id).toBe(a1); // the highest rating wins an even draw
+    expect(pick).toMatchObject({ note: "why", rating: 5, rated_by: "reader" });
+    expect(dailyHighlight.render(pick)).toContain("💭 why");
+    expect(dailyHighlight.render(pick)).not.toContain("*5");
+  });
+
+  test("C14: model ratings are validated, and unrated lists only live highlights with no rating in force", async () => {
+    await syncSource(sql, "readeck", docs("b1"), [hl("a1"), hl("a2", "b1", { note: "*" }), hl("a3")]);
+    await syncReaderRatings(sql);
+    const ids = Object.fromEntries((await sql`SELECT external_id, id FROM highlights`).map((r: any) => [r.external_id, r.id]));
+    expect((await unratedHighlights(sql, 10)).map((h) => h.id).sort()).toEqual([ids.a1, ids.a3].sort());
+    const bad = [
+      { highlight_id: ids.a1, score: 8, reason: "r", model: "m", rubric_version: "v1" },
+      { highlight_id: ids.a1, score: 4.5, reason: "r", model: "m", rubric_version: "v1" },
+      { highlight_id: ids.a1, score: 5, reason: " ", model: "m", rubric_version: "v1" },
+      { highlight_id: 999999, score: 5, reason: "r", model: "m", rubric_version: "v1" },
+    ];
+    expect(await importModelRatings(sql, [...bad, { highlight_id: ids.a1, score: 5, reason: "r", model: "m", rubric_version: "v1" }])).toEqual({ inserted: 1, rejected: 4 });
+    expect((await unratedHighlights(sql, 10)).map((h) => h.id)).toEqual([ids.a3]);
+  });
+
+  test("C15: the daily pick draws from the database by rating; a deleted gem is never drawn", async () => {
+    await syncSource(sql, "readeck", docs("b1"), [hl("g1", "b1", { note: "*" }), hl("u1"), hl("g2", "b1", { note: "*" })]);
+    await syncSource(sql, "readeck", new Map(), [hl("g1", "b1", { note: "*" }), hl("u1")]);
+    await syncReaderRatings(sql);
+    let gems = 0;
+    for (let k = 0; k < 40; k++) {
+      const day = new Date(Date.UTC(2027, 0, 1 + k)).toISOString().slice(0, 10);
+      const p = (await todayPick(sql, day))!;
+      expect(p.text).not.toBe("Passage g2");
+      if (p.text === "Passage g1") gems++;
+    }
+    expect(gems).toBeGreaterThan(18); // weight 8 against 1, even with rest: the gem takes most days (about 30 of 40)
   });
 
   test("A3: only the passage is stored; there is no body column", async () => {

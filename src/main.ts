@@ -7,13 +7,16 @@
  *   bun src/main.ts today [YYYY-MM-DD]   print that day's highlight as JSON
  *   bun src/main.ts random               print one random live highlight as JSON (not recorded as surfaced)
  *   bun src/main.ts import-readwise [--dry-run]   one-off Readwise backfill (needs READWISE_TOKEN), prints a summary
+ *   bun src/main.ts unrated [--limit N]           live highlights with no rating in force, one JSON object per line
+ *   bun src/main.ts import-ratings                model ratings from stdin, one JSON object per line
+ *     ({highlight_id, score 1-7, reason, model, rubric_version}); prints how many were stored and rejected
  *
  * Env: DATABASE_URL, READECK_URL, READECK_TOKEN, BOOKORBIT_URL, BOOKORBIT_USERNAME, BOOKORBIT_PASSWORD, SNIPD_TOKEN,
  *      INGEST_MINUTES (60), PORT (8790), TZ (Europe/Berlin). A source runs only when all its variables are set.
  * ISA: ~/.claude/LIFEOS/USER/MEMORY/WORK/20261105-highlights-db/ISA.md
  */
 import { SQL } from "bun";
-import { migrate, randomHighlight, today, type Counters } from "./store";
+import { importModelRatings, migrate, randomHighlight, syncReaderRatings, today, unratedHighlights, type Counters } from "./store";
 import { importReadwise, ingestBookOrbit, ingestReadeck, ingestSnipd } from "./ingest";
 import { SnipdClient } from "./snipd";
 import { ReadwiseClient } from "./readwise";
@@ -28,7 +31,7 @@ const log = (msg: string, extra: Record<string, unknown> = {}) =>
   console.log(JSON.stringify({ at: new Date().toISOString(), msg, ...extra }));
 
 type SourceResult = { ok: boolean; counters?: Counters; error?: string };
-let lastIngest: { at: string; ok: boolean; sources: Record<string, SourceResult> } | null = null;
+let lastIngest: { at: string; ok: boolean; sources: Record<string, SourceResult>; ratings?: unknown } | null = null;
 
 /** Each configured source runs on its own: one source failing never stops or rolls back another. */
 const sources: { name: string; configured: () => boolean; run: () => Promise<Counters> }[] = [
@@ -60,9 +63,15 @@ async function runIngest() {
     }
   }
   const names = Object.keys(results);
-  const ok = names.length > 0 && names.every((n) => results[n].ok);
-  lastIngest = { at: new Date().toISOString(), ok, sources: results };
-  log(names.length ? (ok ? "ingest done" : "ingest failed") : "ingest skipped: no source configured", { sources: results });
+  let ratings: unknown;
+  try {
+    ratings = await syncReaderRatings(sql);
+  } catch (e: any) {
+    ratings = { error: String(e?.message ?? e) };
+  }
+  const ok = names.length > 0 && names.every((n) => results[n].ok) && !(ratings as any).error;
+  lastIngest = { at: new Date().toISOString(), ok, sources: results, ratings };
+  log(names.length ? (ok ? "ingest done" : "ingest failed") : "ingest skipped: no source configured", { sources: results, ratings });
   return lastIngest;
 }
 
@@ -117,6 +126,17 @@ if (cmd === "ingest") {
   console.log(JSON.stringify(r, null, 1));
   await sql.close();
   process.exit(0);
+} else if (cmd === "unrated") {
+  await migrate(sql);
+  const i = process.argv.indexOf("--limit");
+  const limit = i > 0 ? Math.max(1, Number(process.argv[i + 1]) || 50) : 50;
+  for (const h of await unratedHighlights(sql, limit)) console.log(JSON.stringify(h));
+  await sql.close();
+} else if (cmd === "import-ratings") {
+  await migrate(sql);
+  const lines = (await Bun.stdin.text()).split("\n").filter((l) => l.trim());
+  console.log(JSON.stringify(await importModelRatings(sql, lines.map((l) => JSON.parse(l)))));
+  await sql.close();
 } else if (cmd === "random") {
   console.log(JSON.stringify(await randomHighlight(sql), null, 1));
 } else if (cmd === "today") {
