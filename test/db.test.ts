@@ -39,8 +39,8 @@ d("store against Postgres", () => {
 
   test("C2/C4: a backfill stores every highlight once, and a second run changes nothing", async () => {
     const items = [hl("a1"), hl("a2"), hl("a3", "b2")];
-    expect(await syncSource(sql, "readeck", docs("b1", "b2"), items)).toEqual({ inserted: 3, updated: 0, deleted: 0, unchanged: 0 });
-    expect(await syncSource(sql, "readeck", new Map(), items)).toEqual({ inserted: 0, updated: 0, deleted: 0, unchanged: 3 });
+    expect(await syncSource(sql, "readeck", docs("b1", "b2"), items)).toEqual({ inserted: 3, updated: 0, deleted: 0, unchanged: 0, duplicates: 0 });
+    expect(await syncSource(sql, "readeck", new Map(), items)).toEqual({ inserted: 0, updated: 0, deleted: 0, unchanged: 3, duplicates: 0 });
     const [{ n }] = await sql`SELECT count(*)::int AS n FROM highlights`;
     expect(n).toBe(3);
   });
@@ -50,7 +50,7 @@ d("store against Postgres", () => {
     const before = (await sql`SELECT updated_at FROM highlights WHERE external_id = 'a1'`)[0].updated_at;
     await Bun.sleep(20);
     const c = await syncSource(sql, "readeck", new Map(), [hl("a1", "b1", { note: "my thought" })]);
-    expect(c).toEqual({ inserted: 0, updated: 1, deleted: 1, unchanged: 0 });
+    expect(c).toEqual({ inserted: 0, updated: 1, deleted: 1, unchanged: 0, duplicates: 0 });
     const [a1] = await sql`SELECT note, updated_at FROM highlights WHERE external_id = 'a1'`;
     expect(a1.note).toBe("my thought");
     expect(new Date(a1.updated_at).getTime()).toBeGreaterThan(new Date(before).getTime());
@@ -96,6 +96,27 @@ d("store against Postgres", () => {
     for (let i = 0; i < 20; i++) expect((await randomHighlight(sql))!.text).toBe("Passage a1");
     const [{ n }] = await sql`SELECT count(*)::int AS n FROM surfacings`;
     expect(n).toBe(0);
+  });
+
+  test("C6: a passage already stored from another source is skipped, by same text or containment, and a re-run stays clean", async () => {
+    await syncSource(sql, "readeck", docs("b1"), [
+      hl("r1", "b1", { text: "Habits are the compound interest of self-improvement." }),
+      hl("r2", "b1", { text: "Short one." }),
+    ]);
+    const rw = (id: string, text: string): HighlightInput => ({ ...hl(id, "w1"), source_app: "readwise", text, tags: ["t1"] });
+    const rdocs = new Map([["w1", { ...doc("w1"), source_app: "readwise" }]]);
+    const items = [
+      rw("x1", "habits are the compound   interest of self-improvement."),
+      rw("x2", "As Clear says: habits are the compound interest of self-improvement. Think about it."),
+      rw("x3", "Short one."),
+      rw("x4", "A brand new passage that nobody stored before."),
+    ];
+    expect(await syncSource(sql, "readwise", rdocs, items)).toEqual({ inserted: 1, updated: 0, deleted: 0, unchanged: 0, duplicates: 3 });
+    expect(await syncSource(sql, "readwise", new Map(), items)).toEqual({ inserted: 0, updated: 0, deleted: 0, unchanged: 1, duplicates: 3 });
+    const [row] = await sql`SELECT tags FROM highlights WHERE source_app = ${"readwise"}`;
+    expect(row.tags).toEqual(["t1"]);
+    await syncSource(sql, "readeck", new Map(), [hl("r2", "b1", { text: "Short one." })]);
+    expect((await syncSource(sql, "readwise", new Map(), items)).inserted).toBe(2); // r1 deleted upstream: x1 and x2 come in
   });
 
   test("A3: only the passage is stored; there is no body column", async () => {

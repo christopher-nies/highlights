@@ -1,8 +1,9 @@
 import type { SQL } from "bun";
 import { ReadeckClient, mapAnnotation, mapBookmark } from "./readeck";
 import { BookOrbitClient, mapAnnotation as mapBookOrbitAnnotation, mapBook } from "./bookorbit";
-import { knownDocIds, syncSource, type Counters } from "./store";
-import type { DocInput } from "./model";
+import { ReadwiseClient, isOwnDocument, mapBook as mapReadwiseBook, mapHighlight as mapReadwiseHighlight } from "./readwise";
+import { findDuplicates, knownDocIds, syncSource, type Counters } from "./store";
+import type { DocInput, HighlightInput } from "./model";
 
 /** Pull every Readeck annotation and mirror it. Bookmark details are fetched only for documents not stored yet. */
 export async function ingestReadeck(sql: SQL, client: ReadeckClient): Promise<Counters> {
@@ -26,4 +27,32 @@ export async function ingestBookOrbit(sql: SQL, client: BookOrbitClient): Promis
     if (!known.has(id) && !docs.has(id)) docs.set(id, mapBook(a, client.baseUrl));
   }
   return syncSource(sql, "bookorbit", docs, annotations.map((a) => mapBookOrbitAnnotation(a, client.baseUrl)));
+}
+
+/**
+ * One-off Readwise backfill (not on the timer: Readwise is a source being left behind). Safe to re-run: rows are keyed by
+ * Readwise ids, and passages already stored from Readeck or BookOrbit are skipped (C6). --dry-run writes nothing.
+ */
+export async function importReadwise(sql: SQL, client: ReadwiseClient, { dryRun = false } = {}) {
+  const books = await client.allBooks();
+  const skipped = books
+    .filter((b) => !isOwnDocument(b))
+    .map((b) => ({ title: b.title, category: b.category, source_url: b.source_url, highlights: b.highlights.length }));
+  const docs = new Map<string, DocInput>();
+  const items: HighlightInput[] = [];
+  for (const b of books.filter(isOwnDocument)) {
+    const live = b.highlights.filter((h) => !h.is_deleted && !h.is_discard && h.text?.trim());
+    if (!live.length) continue;
+    docs.set(String(b.user_book_id), mapReadwiseBook(b));
+    items.push(...live.map((h) => mapReadwiseHighlight(h, b)));
+  }
+  const summary = {
+    documents: docs.size,
+    highlights: items.length,
+    gems: items.filter((h) => h.note?.startsWith("*")).length,
+    duplicatesOfOtherSources: (await findDuplicates(sql, "readwise", items)).size,
+    skippedDocuments: skipped,
+  };
+  if (dryRun) return { dryRun: true, ...summary };
+  return { ...summary, counters: await syncSource(sql, "readwise", docs, items) };
 }

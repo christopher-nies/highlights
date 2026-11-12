@@ -21,6 +21,7 @@ export interface HighlightInput {
   location: string | null;
   deep_link: string | null;
   highlighted_at: string | null;
+  tags?: string[];
 }
 
 /** Same passage from two sources should hash the same: collapse whitespace, unify quotes, lowercase. */

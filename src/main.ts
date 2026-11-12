@@ -6,6 +6,7 @@
  *   bun src/main.ts ingest     one ingest run, prints its counters as JSON, exits
  *   bun src/main.ts today [YYYY-MM-DD]   print that day's highlight as JSON
  *   bun src/main.ts random               print one random live highlight as JSON (not recorded as surfaced)
+ *   bun src/main.ts import-readwise [--dry-run]   one-off Readwise backfill (needs READWISE_TOKEN), prints a summary
  *
  * Env: DATABASE_URL, READECK_URL, READECK_TOKEN, BOOKORBIT_URL, BOOKORBIT_USERNAME, BOOKORBIT_PASSWORD,
  *      INGEST_MINUTES (60), PORT (8790), TZ (Europe/Berlin). A source runs only when all its variables are set.
@@ -13,7 +14,8 @@
  */
 import { SQL } from "bun";
 import { migrate, randomHighlight, today, type Counters } from "./store";
-import { ingestBookOrbit, ingestReadeck } from "./ingest";
+import { importReadwise, ingestBookOrbit, ingestReadeck } from "./ingest";
+import { ReadwiseClient } from "./readwise";
 import { ReadeckClient } from "./readeck";
 import { BookOrbitClient } from "./bookorbit";
 import { localDay } from "./model";
@@ -99,6 +101,16 @@ if (cmd === "ingest") {
   const r = await runIngest();
   await sql.close();
   process.exit(r?.ok ? 0 : 1);
+} else if (cmd === "import-readwise") {
+  if (!env.READWISE_TOKEN) {
+    console.error("READWISE_TOKEN is not set");
+    process.exit(2);
+  }
+  await migrate(sql);
+  const r = await importReadwise(sql, new ReadwiseClient(env.READWISE_TOKEN), { dryRun: process.argv.includes("--dry-run") });
+  console.log(JSON.stringify(r, null, 1));
+  await sql.close();
+  process.exit(0);
 } else if (cmd === "random") {
   console.log(JSON.stringify(await randomHighlight(sql), null, 1));
 } else if (cmd === "today") {

@@ -3,7 +3,32 @@ import { join } from "path";
 import { readFileSync } from "fs";
 import { textHash, type DocInput, type HighlightInput } from "./model";
 
-export type Counters = { inserted: number; updated: number; deleted: number; unchanged: number };
+export type Counters = { inserted: number; updated: number; deleted: number; unchanged: number; duplicates: number };
+
+const MIN_CONTAINED = 30;
+const norm = (t: string) => t.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+
+/**
+ * C6: new highlights of this source that repeat a live passage already stored from another source, by the same text
+ * (textHash) or one passage containing the other (word-bounded, at least MIN_CONTAINED characters). The first source
+ * keeps the passage; a duplicate is not stored, and comes in on a later run if the original is deleted.
+ */
+export async function findDuplicates(sql: SQL, sourceApp: string, items: HighlightInput[]): Promise<Set<string>> {
+  const mine = new Set((await sql`SELECT external_id FROM highlights WHERE source_app = ${sourceApp}`).map((r: any) => r.external_id as string));
+  const fresh = items.filter((h) => !mine.has(h.external_id));
+  const dup = new Set<string>();
+  if (!fresh.length) return dup;
+  const others = await sql`SELECT text, text_hash FROM highlights WHERE source_app <> ${sourceApp} AND deleted_at IS NULL`;
+  const hashes = new Set(others.map((r: any) => r.text_hash as string));
+  const long = others.map((r: any) => ` ${norm(r.text)} `).filter((n: string) => n.length >= MIN_CONTAINED + 2);
+  for (const h of fresh) {
+    if (hashes.has(textHash(h.text))) { dup.add(h.external_id); continue; }
+    const n = ` ${norm(h.text)} `;
+    if (n.length < MIN_CONTAINED + 2) continue;
+    if (long.some((o: string) => o.includes(n) || n.includes(o))) dup.add(h.external_id);
+  }
+  return dup;
+}
 
 export async function migrate(sql: SQL) {
   await sql.unsafe(readFileSync(join(import.meta.dir, "..", "schema.sql"), "utf8"));
@@ -26,11 +51,12 @@ export async function syncSource(
   docs: Map<string, DocInput>,
   items: HighlightInput[],
 ): Promise<Counters> {
-  const c: Counters = { inserted: 0, updated: 0, deleted: 0, unchanged: 0 };
+  const c: Counters = { inserted: 0, updated: 0, deleted: 0, unchanged: 0, duplicates: 0 };
   const [{ live }] = await sql`SELECT count(*)::int AS live FROM highlights WHERE source_app = ${sourceApp} AND deleted_at IS NULL`;
   if (items.length === 0 && live > 10) {
     throw new Error(`${sourceApp} listed 0 highlights while ${live} are live; refusing to mark them deleted`);
   }
+  const duplicates = await findDuplicates(sql, sourceApp, items);
 
   await sql.begin(async (tx) => {
     const docId = new Map<string, number>();
@@ -59,11 +85,14 @@ export async function syncSource(
     for (const h of items) {
       seen.add(h.external_id);
       const old = existing.get(h.external_id);
-      if (!old) {
+      if (!old && duplicates.has(h.external_id)) {
+        c.duplicates++;
+      } else if (!old) {
         await tx`
-          INSERT INTO highlights (document_id, source_app, external_id, text, note, color, location, deep_link, highlighted_at, text_hash)
+          INSERT INTO highlights (document_id, source_app, external_id, text, note, color, location, deep_link, highlighted_at, text_hash, tags)
           VALUES (${await lookupDoc(h.doc_external_id)}, ${sourceApp}, ${h.external_id}, ${h.text}, ${h.note}, ${h.color},
-                  ${h.location}, ${h.deep_link}, ${h.highlighted_at}, ${textHash(h.text)})`;
+                  ${h.location}, ${h.deep_link}, ${h.highlighted_at}, ${textHash(h.text)},
+                  ARRAY(SELECT jsonb_array_elements_text(${JSON.stringify(h.tags ?? [])}::text::jsonb)))`;
         c.inserted++;
       } else if (old.text !== h.text || old.note !== h.note || old.color !== h.color || old.deep_link !== h.deep_link || old.deleted_at) {
         await tx`
